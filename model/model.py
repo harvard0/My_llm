@@ -1,6 +1,8 @@
 import math
-from typing import Optional
-
+from typing import Optional, Tuple
+import torch
+import torch.nn as nn
+from torch.nn import functional as F
 from transformers import PretrainedConfig
 
 
@@ -19,11 +21,12 @@ class MizukiMindConfig(PretrainedConfig):
         num_attention_heads: int = 8,
         num_hidden_layers: int = 8,
         num_key_value_heads: int = 2,
+        head_dim: int | None = None,
         vocab_size: int = 6400,
         rms_norm_eps: float = 1e-05,
         rope_theta: int = 1000000,
         inference_rope_scaling: bool = False,
-        flash_attention: bool = True,
+        flash_attn: bool = True,
         ############ MoE ############
         use_moe: bool = False,
         num_experts_per_tok: int = 2,
@@ -47,11 +50,12 @@ class MizukiMindConfig(PretrainedConfig):
         self.num_attention_heads = num_attention_heads
         self.num_hidden_layers = num_hidden_layers
         self.num_key_value_heads = num_key_value_heads
+        self.head_dim = head_dim or hidden_size // num_attention_heads
         self.vocab_size = vocab_size
         self.rms_norm_eps = rms_norm_eps
         self.rope_theta = rope_theta
         self.inference_rope_scaling = inference_rope_scaling
-        self.flash_attention = flash_attention
+        self.flash_attn = flash_attn
         self.use_moe = use_moe
         self.num_experts_per_tok = num_experts_per_tok
         self.n_routed_experts = n_routed_experts
@@ -75,53 +79,24 @@ class MizukiMindConfig(PretrainedConfig):
         )
 
 
-import torch
-import torch.nn as nn
-
-
-# 继承nn.Module类
 class RMSNorm(nn.Module):
     """
     RMSNorm层
     """
 
     def __init__(self, hidden_size: int, eps: float = 1e-05):
-        """
-        Args:
-            hidden_size (int)
-            eps (float, optional): Defaults to 1e-05.
-        """
         super().__init__()
         self.hidden_size = hidden_size
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(hidden_size))
-        self.bias = nn.Parameter(torch.zeros(hidden_size))
 
     # _norm
     def _norm(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        归一化
-        Args:
-            x (torch.Tensor)
-
-        Returns:
-            torch.Tensor
-        """
         return x / (x.pow(2).mean(dim=-1, keepdim=True) + self.eps).sqrt()
 
     # forward
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        前向传播
-        Args:
-            x (torch.Tensor)
-
-        Returns:
-            torch.Tensor
-        """
-        return self.weight * self._norm(x) + self.bias
-
-
+        return self.weight * self._norm(x.float()).type_as(x)
 
 
 def precompute_freqs(
@@ -129,8 +104,9 @@ def precompute_freqs(
     end: int = int(32 * 1024),
     rope_base: float = 1e6,
     rope_scaling: Optional[dict] = None,
-):  
+):
     """
+    预计算 RoPE 频率编码
     Args:
         dim (int): 嵌入维度
         end (int, optional): 最大位置编码长度. Defaults to int(32 * 1024).
@@ -141,7 +117,7 @@ def precompute_freqs(
         tuple: (freqs_cos, freqs_sin)
             freqs_cos (torch.Tensor): 余弦频率编码
             freqs_sin (torch.Tensor): 正弦频率编码
-    """    
+    """
     # 1. 初始化标准 RoPE 频率。
     # torch.arange(0, dim, 2) 生成 [0, 2, 4, ... dim-2]
     # 计算出的 freqs 就是标准的 1 / (base ** (2i / d))
@@ -173,8 +149,8 @@ def precompute_freqs(
             # i (inv_dim(b)) = dim * log(orig_max / (b * 2 * π)) / (2 * log(rope_base))
             def inv_dim(b):
                 return (dim * math.log(orig_max / (b * 2 * math.pi))) / (
-                            2 * math.log(rope_base)
-                        )
+                    2 * math.log(rope_base)
+                )
 
             # 4. 计算高频区和低频区的维度切分点
             # low: 不需要缩放的高频部分的最高索引
@@ -217,6 +193,7 @@ def precompute_freqs(
 
 def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     """
+    应用 RoPE 旋转编码到查询和键向量
     Args:
         q (torch.Tensor): 查询向量
         k (torch.Tensor): 键向量
@@ -229,7 +206,8 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
         tuple: (q_embed, k_embed)
             q_embed (torch.Tensor): 查询向量旋转后的结果
             k_embed (torch.Tensor): 键向量旋转后的结果
-    """    
+    """
+
     # 1. 初始化标准 RoPE 频率。
     # [a:b]->[-b:a]
     def rotate_half(x):
@@ -246,3 +224,142 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
         rotate_half(k) * sin.unsqueeze(unsqueeze_dim)
     )
     return q_embed, k_embed
+
+
+def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
+    """GQA重复键值对
+
+    Args:
+        x (torch.Tensor): 键值对张量
+        [batch_size, seq_len, head, head_dim]
+        n_rep (int): 重复次数
+
+    Returns:
+        torch.Tensor: 重复后的键值对
+        [batch_size, seq_len, head * n_rep, head_dim]
+    """
+    bs, slen, num_key_value_heads, head_dim = x.shape
+    if n_rep == 1:
+        return x
+    return (
+        x[:, :, :, None, :]
+        .expand(bs, slen, num_key_value_heads, n_rep, head_dim)
+        .reshape(bs, slen, num_key_value_heads * n_rep, head_dim)
+    )
+
+
+class Attention(nn.Module):
+    """
+    多头自注意力机制，支持分组查询注意力(GQA)和Flash Attention优化
+    """    
+    def __init__(self, config: MizukiMindConfig):
+        super().__init__()
+
+        # 处理GQA：如果没有指定kv头数，则使用与query相同的头数
+        # 三元运算符：condition ? value1 : value2
+        self.num_key_value_heads = (
+            config.num_key_value_heads
+            if config.num_key_value_heads is not None
+            else config.num_attention_heads
+        )
+
+        assert self.num_key_value_heads % 2 == 0, "num_key_value_heads must be even"
+
+        # 注意力头配置
+        self.n_local_heads = config.num_attention_heads
+        self.n_local_kv_heads = self.num_key_value_heads
+        self.n_rep = self.n_local_heads // self.n_local_kv_heads
+        self.head_dim = config.head_dim
+
+        # 定义线性投影层 (无偏置，节省参数)
+        self.q_proj = nn.Linear(
+            config.hidden_size, config.num_attention_heads * self.head_dim, bias=False
+        )
+        self.k_proj = nn.Linear(
+            config.hidden_size, self.num_key_value_heads * self.head_dim, bias=False
+        )
+        self.v_proj = nn.Linear(
+            config.hidden_size, self.num_key_value_heads * self.head_dim, bias=False
+        )
+        self.o_proj = nn.Linear(
+            config.num_attention_heads * self.head_dim, config.hidden_size, bias=False
+        )
+
+        # RMSNorm层用于归一化
+        self.q_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.k_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        
+        # Dropout层用于正则化
+        self.attn_dropout = nn.Dropout(config.dropout)
+        self.resid_dropout = nn.Dropout(config.dropout)
+        self.dropout = config.dropout
+
+        # 检查是否支持Flash Attention
+        self.flash = (
+            hasattr(torch.nn.functional, "scaled_dot_product_attention")
+            and config.flash_attn
+        )
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        position_embeddings: Tuple[torch.Tensor, torch.Tensor],  # 修改为接收cos和sin
+        past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        use_cache=False,
+        attention_mask: Optional[torch.Tensor] = None,
+    ):  
+        # x: [batch_size, seq_len, hidden]
+        bsz, seq_len, _ = x.shape
+        xq, xk, xv = self.q_proj(x), self.k_proj(x), self.v_proj(x)
+        xq = xq.view(bsz, seq_len, self.n_local_heads, self.head_dim)
+        xk = xk.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
+        xv = xv.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
+
+        # Normalization
+        xq = self.q_norm(xq)
+        xk = self.k_norm(xk)
+        
+        cos, sin = position_embeddings
+        xq, xk = apply_rotary_pos_emb(xq, xk, cos, sin)
+
+        # kv cache
+        if past_key_value is not None:
+            xk = torch.cat([past_key_value[0], xk], dim=1)
+            xv = torch.cat([past_key_value[1], xv], dim=1)
+        past_kv = (xk, xv) if use_cache else None
+
+        # [bsz, seq_len, head, head_dim] -> [bsz, head * n_rep, seq_len, head_dim]
+        xq, xk, xv = (
+            xq.transpose(1, 2),
+            repeat_kv(xk, self.n_rep).transpose(1, 2),
+            repeat_kv(xv, self.n_rep).transpose(1, 2),
+        )
+
+        # 优先使用PyTorch 2.0+的scaled_dot_product_attention（Flash Attention实现）
+        if self.flash and seq_len > 1 and (attention_mask is None or torch.all(attention_mask == 1)):
+            # 如果没有显式的attention_mask，直接传None让底层高效实现
+            attn_mask = None if attention_mask is None else attention_mask.view(bsz, 1, 1, -1).expand(bsz, self.n_local_heads, seq_len, -1).bool()
+            # F.scaled_dot_product_attention是PyTorch在新版本中提供的高效实现
+            output = F.scaled_dot_product_attention(
+                xq, xk, xv,
+                attn_mask=attn_mask,
+                dropout_p=self.dropout if self.training else 0.0,
+                is_causal=True  # 自回归（因果）注意力
+            )
+        else:
+            scores = (xq @ xk.transpose(-2, -1)) / math.sqrt(self.head_dim)
+            
+            # causal mask: 上三角（对角线以上）置为 -inf，防止看到未来信息
+            scores[:, :, :, -seq_len:] += torch.full((seq_len, seq_len), float("-inf"), device=scores.device).triu(1)
+            
+            # 如果有attention_mask(0/1)，将其扩展后转为 -1e9 的加性mask（掩掉pad位置）
+            if attention_mask is not None:
+                attn_mask = attention_mask.unsqueeze(1).unsqueeze(2)
+                scores += (1.0 - attn_mask) * -1e9
+            
+            output = self.attn_dropout(F.softmax(scores.float(), dim=-1).type_as(xq)) @ xv
+        
+        # [bsz, head * n_rep, seq_len, head_dim] -> [bsz, seq_len, n_local_heads * head_dim]
+        output = output.transpose(1, 2).reshape(bsz, seq_len, -1)
+        output = self.resid_dropout(self.o_proj(output))
+        return output, past_kv
