@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 from transformers import PretrainedConfig
+from transformers.activations import ACT2FN
 
 
 class MizukiMindConfig(PretrainedConfig):
@@ -80,10 +81,6 @@ class MizukiMindConfig(PretrainedConfig):
 
 
 class RMSNorm(nn.Module):
-    """
-    RMSNorm层
-    """
-
     def __init__(self, hidden_size: int, eps: float = 1e-05):
         super().__init__()
         self.hidden_size = hidden_size
@@ -104,9 +101,9 @@ def precompute_freqs(
     end: int = int(32 * 1024),
     rope_base: float = 1e6,
     rope_scaling: Optional[dict] = None,
-):
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    预计算 RoPE 频率编码
+    Precompute RoPE frequency encoding.
     Args:
         dim (int): 嵌入维度
         end (int, optional): 最大位置编码长度. Defaults to int(32 * 1024).
@@ -191,7 +188,9 @@ def precompute_freqs(
     return freqs_cos, freqs_sin
 
 
-def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
+def apply_rotary_pos_emb(
+    q, k, cos, sin, position_ids=None, unsqueeze_dim=1
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     应用 RoPE 旋转编码到查询和键向量
     Args:
@@ -227,8 +226,8 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
 
 
 def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
-    """GQA重复键值对
-
+    """
+    GQA: Repeat key-value pairs.
     Args:
         x (torch.Tensor): 键值对张量
         [batch_size, seq_len, head, head_dim]
@@ -250,8 +249,10 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
 
 class Attention(nn.Module):
     """
-    多头自注意力机制，支持分组查询注意力(GQA)和Flash Attention优化
-    """    
+    Multi-Head Attention layer.
+    Supports Group Query Attention (GQA) and Flash Attention optimization.
+    """
+
     def __init__(self, config: MizukiMindConfig):
         super().__init__()
 
@@ -288,7 +289,7 @@ class Attention(nn.Module):
         # RMSNorm层用于归一化
         self.q_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        
+
         # Dropout层用于正则化
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
@@ -307,7 +308,7 @@ class Attention(nn.Module):
         past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         use_cache=False,
         attention_mask: Optional[torch.Tensor] = None,
-    ):  
+    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor] | None]:
         # x: [batch_size, seq_len, hidden]
         bsz, seq_len, _ = x.shape
         xq, xk, xv = self.q_proj(x), self.k_proj(x), self.v_proj(x)
@@ -318,7 +319,7 @@ class Attention(nn.Module):
         # Normalization
         xq = self.q_norm(xq)
         xk = self.k_norm(xk)
-        
+
         cos, sin = position_embeddings
         xq, xk = apply_rotary_pos_emb(xq, xk, cos, sin)
 
@@ -336,30 +337,99 @@ class Attention(nn.Module):
         )
 
         # 优先使用PyTorch 2.0+的scaled_dot_product_attention（Flash Attention实现）
-        if self.flash and seq_len > 1 and (attention_mask is None or torch.all(attention_mask == 1)):
+        if (
+            self.flash
+            and seq_len > 1
+            and (attention_mask is None or torch.all(attention_mask == 1))
+        ):
             # 如果没有显式的attention_mask，直接传None让底层高效实现
-            attn_mask = None if attention_mask is None else attention_mask.view(bsz, 1, 1, -1).expand(bsz, self.n_local_heads, seq_len, -1).bool()
+            attn_mask = (
+                None
+                if attention_mask is None
+                else attention_mask.view(bsz, 1, 1, -1)
+                .expand(bsz, self.n_local_heads, seq_len, -1)
+                .bool()
+            )
             # F.scaled_dot_product_attention是PyTorch在新版本中提供的高效实现
             output = F.scaled_dot_product_attention(
-                xq, xk, xv,
+                xq,
+                xk,
+                xv,
                 attn_mask=attn_mask,
                 dropout_p=self.dropout if self.training else 0.0,
-                is_causal=True  # 自回归（因果）注意力
+                is_causal=True,  # 自回归（因果）注意力
             )
         else:
             scores = (xq @ xk.transpose(-2, -1)) / math.sqrt(self.head_dim)
-            
+
             # causal mask: 上三角（对角线以上）置为 -inf，防止看到未来信息
-            scores[:, :, :, -seq_len:] += torch.full((seq_len, seq_len), float("-inf"), device=scores.device).triu(1)
-            
+            scores[:, :, :, -seq_len:] += torch.full(
+                (seq_len, seq_len), float("-inf"), device=scores.device
+            ).triu(1)
+
             # 如果有attention_mask(0/1)，将其扩展后转为 -1e9 的加性mask（掩掉pad位置）
             if attention_mask is not None:
                 attn_mask = attention_mask.unsqueeze(1).unsqueeze(2)
                 scores += (1.0 - attn_mask) * -1e9
-            
-            output = self.attn_dropout(F.softmax(scores.float(), dim=-1).type_as(xq)) @ xv
-        
+
+            output = (
+                self.attn_dropout(F.softmax(scores.float(), dim=-1).type_as(xq)) @ xv
+            )
+
         # [bsz, head * n_rep, seq_len, head_dim] -> [bsz, seq_len, n_local_heads * head_dim]
         output = output.transpose(1, 2).reshape(bsz, seq_len, -1)
         output = self.resid_dropout(self.o_proj(output))
         return output, past_kv
+
+
+class FeedForward(nn.Module):
+    """
+    Up-Down FeedForward layer.
+    """
+
+    def __init__(self, config: MizukiMindConfig):
+        super().__init__()
+        intermediate_size = config.intermediate_size or int(config.hidden_size * 8 / 3)
+        self.gate_proj = nn.Linear(config.hidden_size, intermediate_size, bias=False)
+        self.down_proj = nn.Linear(intermediate_size, config.hidden_size, bias=False)
+        self.up_proj = nn.Linear(config.hidden_size, intermediate_size, bias=False)
+        self.act_fn = ACT2FN[config.hidden_act]
+
+    def forward(self, x) -> torch.Tensor:
+        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+
+
+class MizukiMindBlock(nn.Module):
+    """
+    Connect Attention and FeedForward layers.
+    """
+
+    def __init__(self, config: MizukiMindConfig):
+        super().__init__()
+        self.attn = Attention(config)
+        self.mlp = FeedForward(config)
+        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
+
+    def forward(
+        self,
+        hidden_state: torch.Tensor,
+        position_embeddings: Tuple[torch.Tensor, torch.Tensor],  # 修改为接收cos和sin
+        past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        use_cache=False,
+        attention_mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        residual = hidden_state
+        hidden_state, present_key_value = self.attn(
+            self.input_layernorm(hidden_state),
+            position_embeddings,
+            past_key_value,
+            use_cache,
+            attention_mask,
+        )
+        
+        hidden_state += residual
+        hidden_state = self.mlp(self.post_attention_layernorm(hidden_state)) + hidden_state
+        return hidden_state, present_key_value
