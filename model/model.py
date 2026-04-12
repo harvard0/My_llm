@@ -1,10 +1,12 @@
 import math
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple, Union
+
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
-from transformers import PretrainedConfig
+from transformers import GenerationMixin, PretrainedConfig
 from transformers.activations import ACT2FN
+from transformers.modeling_outputs import CausalLMOutputWithPast
 
 
 class MizukiMindConfig(PretrainedConfig):
@@ -89,14 +91,14 @@ class RMSNorm(nn.Module):
 
     # _norm
     def _norm(self, x: torch.Tensor) -> torch.Tensor:
-        return x / (x.pow(2).mean(dim=-1, keepdim=True) + self.eps).sqrt()
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
 
     # forward
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.weight * self._norm(x.float()).type_as(x)
 
 
-def precompute_freqs(
+def precompute_freqs_cis(
     dim: int,
     end: int = int(32 * 1024),
     rope_base: float = 1e6,
@@ -182,6 +184,7 @@ def precompute_freqs(
 
     # 9. 计算 Cos 和 Sin，并应用注意力补偿系数 (attn_factor)
     # [end, dim//2*2]
+    # 这里是对半交错配对,不是相邻配对
     freqs_cos = torch.cat([torch.cos(freqs), torch.cos(freqs)], dim=-1) * attn_factor
     freqs_sin = torch.cat([torch.sin(freqs), torch.sin(freqs)], dim=-1) * attn_factor
 
@@ -305,10 +308,10 @@ class Attention(nn.Module):
         self,
         x: torch.Tensor,
         position_embeddings: Tuple[torch.Tensor, torch.Tensor],  # 修改为接收cos和sin
+        attention_mask: Optional[torch.Tensor] = None,
         past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         use_cache=False,
-        attention_mask: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor] | None]:
+    ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
         # x: [batch_size, seq_len, hidden]
         bsz, seq_len, _ = x.shape
         xq, xk, xv = self.q_proj(x), self.k_proj(x), self.v_proj(x)
@@ -404,32 +407,189 @@ class MizukiMindBlock(nn.Module):
     Connect Attention and FeedForward layers.
     """
 
-    def __init__(self, config: MizukiMindConfig):
+    def __init__(self, layer_id: int, config: MizukiMindConfig):
         super().__init__()
+        self.layer_id = layer_id
+
         self.attn = Attention(config)
         self.mlp = FeedForward(config)
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
+        # self.mlp = FeedForward(config) if not config.use_moe else MOEFeedForward(config)
 
     def forward(
         self,
         hidden_state: torch.Tensor,
         position_embeddings: Tuple[torch.Tensor, torch.Tensor],  # 修改为接收cos和sin
+        attention_mask: Optional[torch.Tensor] = None,
         past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         use_cache=False,
-        attention_mask: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
         residual = hidden_state
         hidden_state, present_key_value = self.attn(
             self.input_layernorm(hidden_state),
             position_embeddings,
+            attention_mask,
             past_key_value,
             use_cache,
-            attention_mask,
         )
-        
+
         hidden_state += residual
-        hidden_state = self.mlp(self.post_attention_layernorm(hidden_state)) + hidden_state
+        hidden_state = (
+            self.mlp(self.post_attention_layernorm(hidden_state)) + hidden_state
+        )
         return hidden_state, present_key_value
+
+
+class MizukiMindModel(nn.Module):
+    """
+    MizukiMind model.
+    """
+
+    def __init__(self, config: MizukiMindConfig):
+        super().__init__()
+        self.config = config
+        self.vocab_size, self.hidden_size = config.vocab_size, config.hidden_size
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+        self.dropout = nn.Dropout(config.hidden_dropout)
+        self.layers = nn.ModuleList(
+            [
+                MizukiMindBlock(layer_id, config)
+                for layer_id in range(config.num_hidden_layers)
+            ]
+        )
+        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+        # precompute RoPE
+        freqs_cos, freqs_sin = precompute_freqs_cis(
+            dim=config.head_dim,
+            end=config.max_position_embeddings,
+            rope_base=config.rope_theta,
+            rope_scaling=config.rope_scaling,
+        )
+
+        # register RoPE buffers
+        self.register_buffer("freqs_cos", freqs_cos, persistent=False)
+        self.register_buffer("freqs_sin", freqs_sin, persistent=False)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        past_key_values: Optional[
+            List[Tuple[torch.Tensor, torch.Tensor]] | List[None]
+        ] = None,
+        use_cache: bool = False,
+        **kwargs,
+    ) -> Tuple[torch.Tensor, List[Tuple[torch.Tensor, torch.Tensor]] | List[None]]:
+        batch_size, seq_length = input_ids.shape
+
+        # 兼容性检查：某些框架会传入包含.layers属性的对象，视为不携带past信息
+        if hasattr(past_key_values, "layers"):
+            past_key_values = None
+
+        # past_key_values为每层的(past_k, past_v)列表，如果为None则创建与层数相同的None列表
+        past_key_values = past_key_values or [None] * len(self.layers)
+
+        # past_key_values[0] 形如 (k, v)，k.shape = [bsz, past_seq_len, n_kv_heads, head_dim]
+        start_pos = (
+            past_key_values[0][0].shape[1] if past_key_values[0] is not None else 0
+        )
+
+        hidden_states = self.dropout(self.embed_tokens(input_ids))
+
+        # self.freqs_cos/freqs_sin的shape为 [max_pos, head_dim]
+        position_embeddings = (
+            self.freqs_cos[start_pos : start_pos + seq_length],  # type: ignore
+            self.freqs_sin[start_pos : start_pos + seq_length],  # type: ignore
+        )
+
+        # 逐层前向，通过zip把layer和对应的past_key_value配对
+        presents = []
+        for layer, past_key_value in zip(self.layers, past_key_values):
+            hidden_states, present = layer(
+                hidden_states,
+                position_embeddings,
+                attention_mask=attention_mask,
+                past_key_value=past_key_value,
+                use_cache=use_cache,
+            )
+            presents.append(present)
+
+        # normalization
+        hidden_states = self.norm(hidden_states)
+
+        # aux_loss = sum(
+        #     [l.mlp.aux_loss for l in self.layers if isinstance(l.mlp, MOEFeedForward)],
+        #     hidden_states.new_zeros(1).squeeze(),
+        # )
+
+        return hidden_states, presents
+
+
+class MizukiMindForCausalLM(MizukiMindModel, GenerationMixin):
+    """
+    MizukiMind model for causal language.
+    """
+
+    def __init__(self, config: Optional[MizukiMindConfig] = None):
+        self.config = config or MizukiMindConfig()
+        super().__init__(self.config)
+
+        self.model = MizukiMindModel(self.config)
+        self.lm_head = nn.Linear(
+            self.config.hidden_size, self.config.vocab_size, bias=False
+        )
+
+        self.model.embed_tokens.weight = self.lm_head.weight
+
+    def forward(
+        self,
+        input_ids: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        past_key_values: Optional[
+            List[Tuple[torch.Tensor, torch.Tensor]] | List[None]
+        ] = None,
+        use_cache: bool = False,
+        labels: Optional[torch.Tensor] = None,
+        logits_to_keep: Union[int, torch.Tensor] = 0,
+        **kwargs,
+    ):
+        hidden_states, past_key_values = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+            **kwargs,
+        )
+
+        slice_indices = (
+            slice(-logits_to_keep, None)
+            if isinstance(logits_to_keep, int)
+            else logits_to_keep
+        )
+        logits = self.lm_head(hidden_states[:, slice_indices, :])
+        
+        loss = None
+        if labels is not None:
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            loss = F.cross_entropy(
+                shift_logits.view(-1, shift_logits.size(-1)),
+                shift_labels.view(-1),
+                ignore_index=-100,
+            ).float()
+            
+        if past_key_values is not None and all(pkv is None for pkv in past_key_values):
+            past_key_values = None
+            
+        output = CausalLMOutputWithPast(
+            loss=loss, # type: ignore
+            logits=logits,
+            past_key_values=past_key_values,  # type: ignore
+            hidden_states=hidden_states,
+        )
+        # output.aux_loss = aux_loss
+        return output
