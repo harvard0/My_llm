@@ -4,7 +4,7 @@ from typing import List, Optional, Tuple, Union
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
-from transformers import GenerationMixin, PretrainedConfig
+from transformers import GenerationMixin, PreTrainedModel, PretrainedConfig
 from transformers.activations import ACT2FN
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
@@ -529,7 +529,7 @@ class MizukiMindModel(nn.Module):
         return hidden_states, presents
 
 
-class MizukiMindForCausalLM(MizukiMindModel, GenerationMixin):
+class MizukiMindForCausalLM(PreTrainedModel, GenerationMixin):
     """
     MizukiMind model for causal language.
     """
