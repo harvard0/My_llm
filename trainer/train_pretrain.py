@@ -1,4 +1,3 @@
-from ast import arg
 import os
 import sys
 
@@ -39,7 +38,7 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
     # 遍历数据批次循环
     for step, (input_ids, attention_mask, labels) in enumerate(
         loader, start=start_step + 1
-    ):  
+    ):
         # 将数据移动到指定设备，一般是GPU
         input_ids = input_ids.to(args.device)
         attention_mask = attention_mask.to(args.device)
@@ -58,24 +57,27 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
                 input_ids=input_ids, attention_mask=attention_mask, labels=labels
             )
             # 计算loss
-            loss = res.loss + res.aux_loss
+            loss = res.loss
+            # loss = res.loss + res.aux_loss
             loss = loss / args.accumulation_steps  # 平均化损失，适应梯度累积
         scaler.scale(loss).backward()
 
         # 梯度累积
-        if (step + 1) % args.accumulation_steps == 0:
+        if step % args.accumulation_steps == 0:
             scaler.unscale_(optimizer)  # 在梯度裁剪前取消缩放
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-            scaler.step(optimizer)  # 更新参数
+            scaler.step(optimizer)  # 更新参数,但带有自动溢出检测：如果梯度中存在 NaN 或 Inf，则跳过本次更新，并通知 scaler 减小下一次的缩放因子。
             scaler.update()  # 更新缩放器
             optimizer.zero_grad(set_to_none=True)  # 清零梯度
 
-        if step % args.log_interval == 0 or step == iters - 1:
+        if step % args.log_interval == 0 or step == iters:
             spend_time = time.time() - start_time
             current_loss = loss.item() * args.accumulation_steps  # 恢复真实损失值
+            # current_aux_loss = res.aux_loss.item() if res.aux_loss is not None else 0.0
+            # current_logits_loss = current_loss - current_aux_loss
             current_lr = optimizer.param_groups[-1]["lr"]  # 当前学习率
 
-            eta_min = spend_time / (step + 1) * iters // 60 - spend_time // 60
+            eta_min = spend_time / max(step - start_step, 1) * (iters - step) // 60
 
             Logger(
                 f"Epoch:[{epoch + 1}/{args.epochs}]({step}/{iters}) loss:{current_loss:.6f} lr:{current_lr:.12f} epoch_Time:{eta_min}min:"
@@ -87,7 +89,7 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
                     {"loss": current_loss, "lr": current_lr, "epoch_Time": eta_min}
                 )
 
-        if (step % args.save_interval == 0 or step == iters - 1) and is_main_process():
+        if (step % args.save_interval == 0 or step == iters) and is_main_process():
             model.eval()  # 切换到评估模式
 
             # 构建保存路径
@@ -98,14 +100,17 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
 
             # 📚 分布式模型保存知识点
             # DDP模型需要通过.module访问真正的模型
-            if isinstance(model, torch.nn.parallel.DistributedDataParallel):
-                state_dict = model.module.state_dict()
-            else:
-                state_dict = model.state_dict()
+            raw_model = (
+                model.module if isinstance(model, DistributedDataParallel) else model
+            )
+            raw_model = getattr(
+                raw_model, "_orig_mod", raw_model
+            )  # 检查是否经过compile包装
+            state_dict = raw_model.state_dict()
 
             # 📚 半精度保存知识点
             # 将float32参数转为float16，减少存储空间
-            state_dict = {k: v.half() for k, v in state_dict.items()}
+            state_dict = {k: v.half().cpu() for k, v in state_dict.items()}
             torch.save(state_dict, ckp)
 
             # 保存完整训练状态
@@ -118,26 +123,27 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
                 epoch=epoch,
                 step=step,
                 wandb=wandb,
-                save_dir="../checkpoints",  # ！修正：原"checkpoints"缺少../前缀
+                save_dir="../checkpoints",
             )
 
             model.train()  # 恢复训练模式
+            del state_dict
+
+        del input_ids, labels, res, loss
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="MizukiMind Pretraining")
 
     # ========== 基础训练参数 ==========
-    parser.add_argument(
-        "--save_dir", type=str, default="../out", help="模型保存目录"
-    )  # ！修正：原"out"缺少../前缀
+    parser.add_argument("--save_dir", type=str, default="../out", help="模型保存目录")
     parser.add_argument(
         "--save_weight", default="pretrain", type=str, help="保存权重的前缀名"
     )
     parser.add_argument(
         "--epochs", type=int, default=1, help="训练轮数（建议1轮zero或2-6轮充分训练）"
     )
-    parser.add_argument("--batch_size", type=int, default=32, help="batch size")
+    parser.add_argument("--batch_size", type=int, default=16, help="batch size")
     parser.add_argument("--learning_rate", type=float, default=5e-4, help="初始学习率")
 
     # ========== 硬件和性能参数 ==========
@@ -152,7 +158,7 @@ if __name__ == "__main__":
 
     # ========== 训练策略参数 ==========
     parser.add_argument(
-        "--accumulation_steps", type=int, default=8, help="梯度累积步数"
+        "--accumulation_steps", type=int, default=16, help="梯度累积步数"
     )
     parser.add_argument("--grad_clip", type=float, default=1.0, help="梯度裁剪阈值")
     parser.add_argument("--log_interval", type=int, default=100, help="日志打印间隔")
@@ -176,7 +182,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--data_path",
         type=str,
-        default="../dataset/pretrain_hq.jsonl",  # ！修正：原"dataset/..."缺少../前缀
+        default="../dataset/pretrain_t2t_mini.jsonl",
         help="预训练数据路径",
     )
     parser.add_argument(
@@ -198,7 +204,13 @@ if __name__ == "__main__":
     parser.add_argument(
         "--wandb_project", type=str, default="MizukiMind-Pretrain", help="wandb项目名"
     )
-
+    parser.add_argument(
+        "--use_compile",
+        default=0,
+        type=int,
+        choices=[0, 1],
+        help="是否使用torch.compile加速（0=否，1=是）",
+    )
     # 解析命令行参数
     args = parser.parse_args()
 
@@ -257,7 +269,7 @@ if __name__ == "__main__":
     # 📚 上下文管理器知识点
     # CPU不支持autocast，使用nullcontext作为空操作
     autocast_ctx = (
-        nullcontext() if device_type == "cpu" else torch.amp.autocast(device_type=device_type, dtype=dtype) # type: ignore
+        nullcontext() if device_type == "cpu" else torch.amp.autocast(device_type=device_type, dtype=dtype)  # type: ignore
     )
 
     # ========== 4. 配置WandB实验跟踪 ==========
@@ -280,7 +292,7 @@ if __name__ == "__main__":
         # 构建实验名称，包含关键超参数
         wandb_run_name = f"MizukiMind-Pretrain-Epoch-{args.epochs}-BatchSize-{args.batch_size}-LearningRate-{args.learning_rate}"
         wandb.init(
-            project=args.wandb_project, name=wandb_run_name, id=wandb_id, resume=resume # type: ignore
+            project=args.wandb_project, name=wandb_run_name, id=wandb_id, resume=resume  # type: ignore
         )
 
     # ========== 5. 定义模型、数据、优化器 ==========
@@ -299,10 +311,11 @@ if __name__ == "__main__":
 
     train_sampler = DistributedSampler(train_ds) if dist.is_initialized() else None
 
-    scaler = torch.cuda.amp.GradScaler(enabled=(args.dtype == "float16"))
+    scaler = torch.amp.GradScaler(enabled=(args.dtype == "float16"))  # type: ignore
 
     optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)
 
+    # ========== 6. 从ckp恢复状态 ==========
     start_epoch, start_step = 0, 0
     if ckp_data:
         # 恢复模型参数
@@ -314,6 +327,11 @@ if __name__ == "__main__":
         # 恢复训练进度
         start_epoch = ckp_data["epoch"]
         start_step = ckp_data.get("step", 0)
+
+    # ========== 7. 编译和分布式包装 ==========
+    # if args.use_compile == 1:
+    #     model = torch.compile(model)
+    #     Logger('torch.compile enabled')
 
     if dist.is_initialized():
         # 📚 RoPE位置编码特殊处理
@@ -352,4 +370,31 @@ if __name__ == "__main__":
                 num_workers=args.num_workers,
                 pin_memory=True,
             )
+            train_epoch(epoch, loader, len(loader), 0, wandb)
+
+    # ========== 8. 开始训练 ==========
+    for epoch in range(start_epoch, args.epochs):
+        
+        # 📚 分布式采样器epoch设置
+        # 每个epoch设置不同的随机种子，确保数据顺序随机化
+        if train_sampler:
+            train_sampler.set_epoch(epoch)
+            
+        indices = torch.randperm(len(train_ds)).tolist()
+        skip = start_step if (epoch == start_epoch and start_step > 0) else 0
+        batch_sampler = SkipBatchSampler(
+            train_sampler or indices, args.batch_size, skip
+        )
+        loader = DataLoader(
+            train_ds,
+            batch_sampler=batch_sampler,
+            num_workers=args.num_workers,
+            pin_memory=True,
+        )
+        if skip > 0:
+            Logger(
+                f"Epoch [{epoch + 1}/{args.epochs}]: 跳过前{start_step}个step，从step {start_step + 1}开始"
+            )
+            train_epoch(epoch, loader, len(loader) + skip, start_step, wandb)
+        else:
             train_epoch(epoch, loader, len(loader), 0, wandb)

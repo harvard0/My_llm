@@ -1,13 +1,23 @@
 # import torch
 # print(torch.cuda.is_available())
 
-# import os
-# current_dir = os.path.dirname(os.path.abspath(__file__))
-# project_root = os.path.dirname(current_dir)
-# project_root1 = os.path.dirname(project_root)
-# tokenizer_path = os.path.join(project_root, "model")
-# print(current_dir, project_root, project_root1, tokenizer_path)
+import os
+import sys
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from datasets import load_dataset
-data = load_dataset("json", data_files='/home/mizuki/code/my_minimind/dataset/pretrain_t2t_mini.jsonl' ,split="train")
-print(data[0])
+from model.MizukiModel import MizukiMindConfig
+from trainer.trainer_utils import (  # 训练工具函数
+    lm_checkpoint,
+)
+
+lm_config = MizukiMindConfig(
+    hidden_size=512,
+    num_hidden_layers=8,
+    use_moe=False,
+)
+
+ckp_data = lm_checkpoint(
+        lm_config, weight='pretrain', save_dir="../checkpoints"
+    ) 
+
+print(ckp_data['epoch'], ckp_data['step']) # type: ignore

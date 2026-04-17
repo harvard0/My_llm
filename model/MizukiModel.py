@@ -453,7 +453,7 @@ class MizukiMindModel(nn.Module):
         self.config = config
         self.vocab_size, self.hidden_size = config.vocab_size, config.hidden_size
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
-        self.dropout = nn.Dropout(config.hidden_dropout)
+        self.dropout = nn.Dropout(config.dropout)
         self.layers = nn.ModuleList(
             [
                 MizukiMindBlock(layer_id, config)
