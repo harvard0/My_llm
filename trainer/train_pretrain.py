@@ -11,7 +11,7 @@ import warnings  # 警告控制
 import torch
 import torch.distributed as dist  # 分布式训练支持
 from contextlib import nullcontext  # 上下文管理器
-from torch import optim, nn  # 优化器和神经网络模块
+from torch import optim  # 优化器
 from torch.nn.parallel import DistributedDataParallel  # 分布式数据并行
 from torch.utils.data import DataLoader, DistributedSampler  # 数据加载器
 
