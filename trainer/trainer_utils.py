@@ -7,6 +7,31 @@ import torch.distributed as dist
 from torch.utils.data import Sampler
 
 
+# def get_model_params(model, config):
+#     total = sum(p.numel() for p in model.parameters()) / 1e6
+#     n_routed = getattr(config, "n_routed_experts", getattr(config, "num_experts", 0))
+#     n_active = getattr(config, "num_experts_per_tok", 0)
+#     n_shared = getattr(config, "n_shared_experts", 0)
+#     expert = (
+#         sum(p.numel() for n, p in model.named_parameters() if "mlp.experts.0." in n)
+#         / 1e6
+#     )
+#     shared_expert = (
+#         sum(
+#             p.numel()
+#             for n, p in model.named_parameters()
+#             if "mlp.shared_experts.0." in n
+#         )
+#         / 1e6
+#     )
+#     base = total - (expert * n_routed) - (shared_expert * n_shared)
+#     active = base + (expert * n_active) + (shared_expert * n_shared)
+#     if active < total:
+#         Logger(f"Model Params: {total:.2f}M-A{active:.2f}M")
+#     else:
+#         Logger(f"Model Params: {total:.2f}M")
+
+
 # 检查是否是主进程
 def is_main_process():
     return not dist.is_initialized() or dist.get_rank() == 0
@@ -20,8 +45,8 @@ def Logger(content):
 
 # 动态学习率计算
 def get_lr(current_step, total_steps, lr):
-    return (
-        lr * (0.1 + 0.45 * (1 + math.cos(math.pi * current_step / total_steps)))
+    return lr * (
+        0.1 + 0.45 * (1 + math.cos(math.pi * current_step / total_steps))
     )  # step=0→lr, step=end→0.1*lr
 
 
@@ -87,7 +112,7 @@ def lm_checkpoint(
 
         resume_data = {
             "model": state_dict,
-            "optimizer": optimizer.state_dict(), # type: ignore
+            "optimizer": optimizer.state_dict(),  # type: ignore
             "epoch": epoch,
             "step": step,
             "world_size": dist.get_world_size() if dist.is_initialized() else 1,
@@ -144,7 +169,7 @@ def init_model(
 
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
 
-    model = MizukiMindForCausalLM(lm_config).to(device) # type: ignore
+    model = MizukiMindForCausalLM(lm_config).to(device)  # type: ignore
 
     if from_weight != "none":
         moe_suffix = (
