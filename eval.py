@@ -155,7 +155,7 @@ def main():
             "add_generation_prompt": True,
         }
         if args.weight == "reason":
-            templates["enable_thinking"] = True  # 仅Reason模型使用
+            templates["open_thinking"] = True  # 仅Reason模型使用
         inputs = (
             tokenizer.apply_chat_template(**templates)
             if args.weight != "pretrain"

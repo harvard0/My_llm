@@ -57,8 +57,7 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
                 input_ids=input_ids, attention_mask=attention_mask, labels=labels
             )
             # 计算loss
-            loss = res.loss
-            # loss = res.loss + res.aux_loss
+            loss = res.loss + res.aux_loss
             loss = loss / args.accumulation_steps  # 平均化损失，适应梯度累积
         scaler.scale(loss).backward()
 
@@ -73,8 +72,8 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
         if step % args.log_interval == 0 or step == iters:
             spend_time = time.time() - start_time
             current_loss = loss.item() * args.accumulation_steps  # 恢复真实损失值
-            # current_aux_loss = res.aux_loss.item() if res.aux_loss is not None else 0.0
-            # current_logits_loss = current_loss - current_aux_loss
+            current_aux_loss = res.aux_loss.item() if res.aux_loss is not None else 0.0
+            current_logits_loss = current_loss - current_aux_loss
             current_lr = optimizer.param_groups[-1]["lr"]  # 当前学习率
 
             eta_min = spend_time / max(step - start_step, 1) * (iters - step) // 60
@@ -86,7 +85,7 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
             # 记录到实验跟踪系统
             if wandb:
                 wandb.log(
-                    {"loss": current_loss, "lr": current_lr, "epoch_Time": eta_min}
+                    {"loss": current_loss, "logits_loss": current_logits_loss, "aux_loss": current_aux_loss,"lr": current_lr, "epoch_Time": eta_min}
                 )
 
         if (step % args.save_interval == 0 or step == iters) and is_main_process():
@@ -269,7 +268,7 @@ if __name__ == "__main__":
     # 📚 上下文管理器知识点
     # CPU不支持autocast，使用nullcontext作为空操作
     autocast_ctx = (
-        nullcontext() if device_type == "cpu" else torch.amp.autocast(device_type=device_type, dtype=dtype)  # type: ignore
+        nullcontext() if device_type == "cpu" else torch.amp.autocast(device_type=device_type, dtype=dtype)
     )
 
     # ========== 4. 配置WandB实验跟踪 ==========
@@ -290,9 +289,9 @@ if __name__ == "__main__":
         resume = "must" if wandb_id else None  # 必须恢复到指定实验
 
         # 构建实验名称，包含关键超参数
-        wandb_run_name = f"MizukiMind-Pretrain-Epoch-{args.epochs}-BatchSize-{args.batch_size}-LearningRate-{args.learning_rate}"
+        wandb_run_name = f"MizukiMind-Pretrain-{'MoE' if args.use_moe else ''}-Epoch-{args.epochs}-BatchSize-{args.batch_size}-LearningRate-{args.learning_rate}"
         wandb.init(
-            project=args.wandb_project, name=wandb_run_name, id=wandb_id, resume=resume  # type: ignore
+            project=args.wandb_project, name=wandb_run_name, id=wandb_id, resume=resume 
         )
 
     # ========== 5. 定义模型、数据、优化器 ==========
@@ -311,7 +310,7 @@ if __name__ == "__main__":
 
     train_sampler = DistributedSampler(train_ds) if dist.is_initialized() else None
 
-    scaler = torch.amp.GradScaler(enabled=(args.dtype == "float16"))  # type: ignore
+    scaler = torch.amp.GradScaler(enabled=(args.dtype == "float16")) 
 
     optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)
 
@@ -329,48 +328,15 @@ if __name__ == "__main__":
         start_step = ckp_data.get("step", 0)
 
     # ========== 7. 编译和分布式包装 ==========
-    # if args.use_compile == 1:
-    #     model = torch.compile(model)
-    #     Logger('torch.compile enabled')
+    if args.use_compile == 1:
+        model = torch.compile(model)
+        Logger('torch.compile enabled')
 
     if dist.is_initialized():
         # 📚 RoPE位置编码特殊处理
         # freqs_cos, freqs_sin是位置编码缓存，不需要梯度同步
-        model._ddp_params_and_buffers_to_ignore = {"freqs_cos", "freqs_sin"}  # type: ignore
+        model._ddp_params_and_buffers_to_ignore = {"freqs_cos", "freqs_sin"} 
         model = DistributedDataParallel(model, device_ids=[local_rank])
-
-    for epoch in range(start_epoch, args.epochs):
-        # 📚 分布式采样器epoch设置
-        # 每个epoch设置不同的随机种子，确保数据顺序随机化
-        if train_sampler:
-            train_sampler.set_epoch(epoch)
-
-        # 📚 断点续训逻辑
-        if epoch == start_epoch and start_step > 0:  # 第一个epoch且存在检查点
-            # 使用跳批采样器，跳过已训练的数据
-            batch_sampler = SkipBatchSampler(
-                train_sampler or range(len(train_ds)), args.batch_size, start_step + 1
-            )
-            loader = DataLoader(
-                train_ds,
-                batch_sampler=batch_sampler,
-                num_workers=args.num_workers,
-                pin_memory=True,
-            )
-            Logger(
-                f"Epoch [{epoch + 1}/{args.epochs}]: 跳过前{start_step}个step，从step {start_step + 1}开始"
-            )
-            train_epoch(epoch, loader, len(loader) + start_step + 1, start_step, wandb)
-        else:  # 默认从头开始
-            loader = DataLoader(
-                train_ds,
-                batch_size=args.batch_size,
-                shuffle=(train_sampler is None),
-                sampler=train_sampler,
-                num_workers=args.num_workers,
-                pin_memory=True,
-            )
-            train_epoch(epoch, loader, len(loader), 0, wandb)
 
     # ========== 8. 开始训练 ==========
     for epoch in range(start_epoch, args.epochs):

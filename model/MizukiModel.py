@@ -401,6 +401,196 @@ class FeedForward(nn.Module):
     def forward(self, x) -> torch.Tensor:
         return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 
+class MoEGate(nn.Module):
+    def __init__(self, config: MizukiMindConfig):
+        super().__init__()
+        self.config = config
+        self.top_k = config.num_experts_per_tok
+        self.n_routed_experts = config.n_routed_experts
+
+        self.scoring_func = config.scoring_func
+        self.alpha = config.aux_loss_alpha
+        self.seq_aux = config.seq_aux
+
+        self.norm_topk_prob = config.norm_topk_prob
+        self.gating_dim = config.hidden_size
+        self.weight = nn.Parameter(
+            torch.empty((self.n_routed_experts, self.gating_dim))
+        )
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+
+    def forward(self, hidden_states):
+        bsz, seq_len, h = hidden_states.shape
+        # shape: [bsz * seq_len, hidden]
+        hidden_states = hidden_states.view(-1, h)
+        logits = F.linear(hidden_states, self.weight, None)
+
+        if self.scoring_func == "softmax":
+            # shape: [bsz * seq_len, n_routed_experts]
+            scores = logits.softmax(dim=-1)
+        else:
+            raise NotImplementedError(
+                f"insupportable scoring function for MoE gating: {self.scoring_func}"
+            )
+
+        # shape: [bsz * seq_len, top_k]
+        topk_weight, topk_idx = torch.topk(scores, k=self.top_k, dim=-1, sorted=False)
+
+        # Normalization：由于只取了 K 个专家，这 K 个专家的概率和不为 1，需要重新归一化
+        if self.top_k > 1 and self.norm_topk_prob:
+            denominator = topk_weight.sum(dim=-1, keepdim=True) + 1e-20
+            topk_weight = topk_weight / denominator
+
+        # Load Balancing（负载均衡）：惩罚那些分配极度不均的情况，鼓励模型将 Token 均匀地分发给所有专家
+        if self.training and self.alpha > 0.0:
+            scores_for_aux = scores
+            aux_topk = self.top_k
+            # shape: [bsz, seq_len * aux_topk]
+            topk_idx_for_aux_loss = topk_idx.view(bsz, -1)
+            # Sequence-level 序列级负载均衡
+            if self.seq_aux:
+                scores_for_seq_aux = scores_for_aux.view(bsz, seq_len, -1)
+                
+                # shape: [bsz, n_routed_experts]，统计每条序列里各个专家被选中的次数
+                ce = torch.zeros(
+                    bsz, self.n_routed_experts, device=hidden_states.device
+                ) 
+                # 归一化为负载因子
+                ce.scatter_add_(
+                    dim=1,
+                    index=topk_idx_for_aux_loss,
+                    src=torch.ones(bsz, seq_len * aux_topk, device=hidden_states.device),
+                ).div_(seq_len * aux_topk / self.n_routed_experts)
+                # 负载率 * 平均概率，高频选中（ce）且概率高的专家产生的loss大
+                aux_loss = (ce * scores_for_seq_aux.mean(dim=1)).sum(
+                    dim=1
+                ).mean() * self.alpha
+            # Batch-level 批次级负载均衡
+            else:
+                # shape: [bsz * seq_len * aux_topk, n_routed_experts]
+                mask_ce = F.one_hot(
+                    topk_idx_for_aux_loss.view(-1), num_classes=self.n_routed_experts
+                )
+                # shape: [n_routed_experts]，统计每个专家在批次中被选中的次数
+                ce = mask_ce.float().mean(0)
+                # shape: [n_routed_experts]，统计每个专家的平均概率
+                Pi = scores_for_aux.mean(0)
+                # shape: [n_routed_experts]，计算每个专家的负载因子fi = ce * n_routed_experts
+                fi = ce * self.n_routed_experts
+                # shape: [n_routed_experts]，计算每个专家的负载均衡损失
+                aux_loss = (Pi * fi).sum() * self.alpha
+        else:
+            aux_loss = scores.new_zeros(1).squeeze()
+        return topk_idx, topk_weight, aux_loss
+
+
+class MoEFeedForward(nn.Module): 
+    def __init__(self, config: MizukiMindConfig):
+        super().__init__()
+        self.config = config
+        # 专家层
+        self.experts = nn.ModuleList(
+            [FeedForward(config) for _ in range(config.n_routed_experts)]
+        )
+        # 门控层
+        self.gate = MoEGate(config)
+        if config.n_shared_experts > 0:
+            self.shared_experts = nn.ModuleList(
+                [FeedForward(config) for _ in range(config.n_shared_experts)]
+            )
+
+    def forward(self, x):
+        identity = x
+        orig_shape = x.shape
+
+        # 使用门控机制选择专家
+        topk_idx, topk_weight, aux_loss = self.gate(x)
+        # 展开x以便处理 [bsz * seq_len, hidden]
+        x = x.view(-1, x.shape[-1])
+
+        # shape: [bsz * seq_len * top_k]
+        flat_topk_idx = topk_idx.view(-1)
+        
+        if self.training:
+            # 按照定义的num_experts_per_tok重复输入token
+            # 每个token安排num_experts_per_tok个专家处理
+            # shape: [bsz * seq_len * num_experts_per_tok, hidden]
+            x = x.repeat_interleave(self.config.num_experts_per_tok, dim=0)
+            # y是空张量，和x形状相同
+            y = torch.empty_like(x, dtype=x.dtype)
+            # 遍历所有专家
+            for i, expert in enumerate(self.experts):
+                # 找到所有指向专家i的token
+                # 然后将这些token输入专家i进行处理
+                # 最后将结果放回y对应位置
+                expert_out = expert(x[flat_topk_idx == i])
+                if expert_out.shape[0] > 0:
+                    y[flat_topk_idx == i] = expert_out.to(y.dtype)
+                # 如果专家没分到 Token，会执行一段“空转”代码，防止分布式训练（DDP）时梯度计算图断裂导致报错。
+                else:
+                    y[flat_topk_idx == i] = expert_out.to(y.dtype) + 0 * sum(
+                        p.sum() for p in expert.parameters()
+                    )
+            # 加权求和
+            # 最后的y意义是每个token经过专家处理后的加权结果
+            y = (y.view(*topk_weight.shape, -1) * topk_weight.unsqueeze(-1)).sum(dim=1)
+            y = y.view(*orig_shape)
+        # 如果是推理阶段
+        else:
+            y = self.moe_infer(x, flat_topk_idx, topk_weight.view(-1, 1)).view(
+                *orig_shape
+            )
+        if self.config.n_shared_experts > 0:
+            for expert in self.shared_experts:
+                y = y + expert(identity)
+        self.aux_loss = aux_loss
+        return y
+
+    @torch.no_grad()
+    # MoE推理方法
+    def moe_infer(self, x, flat_expert_indices, flat_expert_weights):
+        # 使用cache，创建一个和x形状相同的零张量
+        expert_cache = torch.zeros_like(x)
+        # 对专家索引进行排序，最后是[0,0,0,1,1,2,2,2,...]这样的顺序
+        # 分拣
+        idxs = flat_expert_indices.argsort()
+        # 统计每个专家被分配到的token数量
+        # 打包
+        tokens_per_expert = flat_expert_indices.bincount().cpu().numpy().cumsum(0)
+        # 计算每个token对应的专家索引
+        token_idxs = idxs // self.config.num_experts_per_tok
+        # 对每个打包好的包进行处理
+        for i, end_idx in enumerate(tokens_per_expert):
+            # 计算当前包的起始位置
+            start_idx = 0 if i == 0 else tokens_per_expert[i - 1]
+            if start_idx == end_idx:
+                continue
+            # 取出当前包对应的专家
+            expert = self.experts[i]
+            # 取出token对应的原始id
+            exp_token_idx = token_idxs[start_idx:end_idx]
+            # 取出token对应的数据
+            expert_tokens = x[exp_token_idx]
+            # 计算专家输出，一次性处理当前包的所有token
+            # shape: [num_experts_per_tok, hidden]
+            expert_out = expert(expert_tokens).to(expert_cache.dtype)
+            # 加权
+            expert_out.mul_(flat_expert_weights[idxs[start_idx:end_idx]])
+            # 将结果散点加到缓存中对应位置
+            # tips：既然 exp_token_idx 里已经记录了这 N 个 Token 的原先行号（比如 [0, 5, 12]），
+            # 直接写 expert_cache[exp_token_idx] += expert_out 不行吗？
+            # 在普通的 Python 逻辑里可以，但在追求极致并行的底层 CUDA 算子 scatter_add_ 中不行。
+            # scatter_add_ 强制要求 index 的形状必须和数据源 src（也就是 expert_out）的形状完全一样大！ 
+            # 因为 expert_out 是一个二维矩阵 [N, HiddenSize]，包含了大量的特征维度，
+            # 所以我们必须把只有一维的行号 [N]，也强行拉伸成 [N, HiddenSize] 的矩阵。
+            expert_cache.scatter_add_(
+                0, exp_token_idx.view(-1, 1).repeat(1, x.shape[-1]), expert_out
+            )
+
+        return expert_cache
 
 class MizukiMindBlock(nn.Module):
     """
@@ -412,12 +602,11 @@ class MizukiMindBlock(nn.Module):
         self.layer_id = layer_id
 
         self.attn = Attention(config)
-        self.mlp = FeedForward(config)
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
-        # self.mlp = FeedForward(config) if not config.use_moe else MOEFeedForward(config)
+        self.mlp = FeedForward(config) if not config.use_moe else MoEFeedForward(config)
 
     def forward(
         self,
@@ -483,7 +672,7 @@ class MizukiMindModel(nn.Module):
         ] = None,
         use_cache: bool = False,
         **kwargs,
-    ) -> Tuple[torch.Tensor, List[Tuple[torch.Tensor, torch.Tensor]] | List[None]]:
+    ) -> Tuple[torch.Tensor, List[Tuple[torch.Tensor, torch.Tensor]] | List[None], int]:
         batch_size, seq_length = input_ids.shape
 
         # 兼容性检查：某些框架会传入包含.layers属性的对象，视为不携带past信息
@@ -521,12 +710,12 @@ class MizukiMindModel(nn.Module):
         # normalization
         hidden_states = self.norm(hidden_states)
 
-        # aux_loss = sum(
-        #     [l.mlp.aux_loss for l in self.layers if isinstance(l.mlp, MOEFeedForward)],
-        #     hidden_states.new_zeros(1).squeeze(),
-        # )
+        aux_loss = sum(
+            [layer.mlp.aux_loss for layer in self.layers if isinstance(layer.mlp, MoEFeedForward)],
+            hidden_states.new_zeros(1).squeeze(),
+        )
 
-        return hidden_states, presents
+        return hidden_states, presents, aux_loss
 
 
 class MizukiMindForCausalLM(PreTrainedModel, GenerationMixin):
@@ -557,7 +746,7 @@ class MizukiMindForCausalLM(PreTrainedModel, GenerationMixin):
         logits_to_keep: Union[int, torch.Tensor] = 0,
         **kwargs,
     ):
-        hidden_states, past_key_values = self.model(
+        hidden_states, past_key_values, aux_loss = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             past_key_values=past_key_values,
@@ -586,10 +775,10 @@ class MizukiMindForCausalLM(PreTrainedModel, GenerationMixin):
             past_key_values = None
             
         output = CausalLMOutputWithPast(
-            loss=loss, # type: ignore
+            loss=loss,
             logits=logits,
-            past_key_values=past_key_values,  # type: ignore
+            past_key_values=past_key_values,
             hidden_states=hidden_states,
         )
-        # output.aux_loss = aux_loss
+        output.aux_loss = aux_loss
         return output
