@@ -250,7 +250,7 @@ if __name__ == "__main__":
     ckp_data = (
         lm_checkpoint(
             lm_config, weight=args.save_weight, save_dir="../checkpoints"
-        )  # ！修正：原"checkpoints"缺少../前缀
+        ) 
         if args.from_resume == 1
         else None
     )
