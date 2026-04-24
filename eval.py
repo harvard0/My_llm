@@ -123,6 +123,12 @@ def main():
         type=str,
         help="运行设备",
     )
+    parser.add_argument(
+        "--repetition_penalty",
+        default=1.0,
+        type=float,
+        help="重复惩罚惩罚因子",
+    )
     args = parser.parse_args()
 
     prompts = [
@@ -161,6 +167,7 @@ def main():
             if args.weight != "pretrain"
             else (tokenizer.bos_token + prompt)
         )
+        # inputs = inputs.replace("<think>\n\n</think>\n\n", "")
         inputs = tokenizer(inputs, return_tensors="pt", truncation=True).to(args.device)
 
         print("🤖️: ", end="")
@@ -175,7 +182,7 @@ def main():
             eos_token_id=tokenizer.eos_token_id,
             top_p=args.top_p,
             temperature=args.temperature,
-            repetition_penalty=1.0,
+            repetition_penalty=args.repetition_penalty,
         )
         
         response = tokenizer.decode(
