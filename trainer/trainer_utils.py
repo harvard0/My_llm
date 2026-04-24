@@ -65,11 +65,49 @@ def init_distributed_mode():
 def setup_seed(seed: int):
     random.seed(seed)
     np.random.seed(seed)
+    # CPU 级别的随机性，CPU 上使用 torch.rand()、torch.randn()，
+    # 或者在模型还没被 .to("cuda") 之前进行的权重初始化操作。
     torch.manual_seed(seed)
+    # 当前单块 GPU 的随机性,数据或模型转移到 GPU 后，
+    # 所有的随机操作（比如 GPU 上的 Dropout、GPU 上的随机采样）
     torch.cuda.manual_seed(seed)
+    # 所有 GPU 的随机性,DDP 多卡分布式训练，
+    # 这行代码会一次性把所有显卡的随机数种子全部设为相同的值。
     torch.cuda.manual_seed_all(seed)
+    
+    # 强制 cuDNN 使用“确定性算法
+    # 不用快但是结果随机的算法，使用计算顺序都绝对严格一致的算法，消除了底层硬件级别的微小数值波动。
     torch.backends.cudnn.deterministic = True
+    # 关闭 cuDNN 的“自动调优寻路”功能
+    # 默认情况下，如果这个值为 True，cuDNN 会在你训练的第一个 Batch 时，
+    # 把所有的卷积算法都跑一遍（Benchmark），看看在你的特定输入尺寸和特定型号显卡下，哪种算法最快。
+    # 然后后续的训练都沿用这个最快的算法。
     torch.backends.cudnn.benchmark = False
+
+
+def seed_worker(worker_id):
+    """
+    DataLoader 多进程数据加载的随机数种子重置函数。
+
+    【为什么需要这个函数？(问题背景)】
+    当 DataLoader 的 num_workers > 0 时，OS 会通过 Fork 机制创建子进程。
+    这会导致所有子进程完美克隆主进程的 Python `random` 和 `numpy.random` 的全局状态。
+    如果不加干预，所有数据处理子进程（Worker）将会生成一模一样的随机数序列，
+    导致数据增强（如随机插入 System Prompt）失去真正的随机性。
+
+    【底层原理与逻辑】
+    PyTorch 为了避免多线程同态化，会在底层自动给每个子进程的 `torch` 派发一个独立的专属种子
+    （生成规则为：根据主进程seed随机出来的 base_seed + worker_id）。
+    本函数的作用就是提取 PyTorch 生成的这个专属种子，并同步给 Python 和 Numpy。
+
+    【为什么要有 % 2**32？】
+    PyTorch 派发的种子是 64 位大整数。而 Python 原生的 random 以及 Numpy (MT19937算法)
+    底层只接受 32 位无符号整数（范围 0 ~ 4294967295）。
+    直接传入 64 位整数会导致程序抛出异常，因此必须进行取模截断适配。
+    """
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
 
 
 # 设置检查点

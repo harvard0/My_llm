@@ -22,8 +22,15 @@ import torch
 
 # print(ckp_data['epoch'], ckp_data['step']) # type: ignore
 
-a = torch.tensor([1, 2, 0, 1, 2, 3, 0, 1, 2], dtype=torch.int32)
-b = a.bincount()
-print(b)
-c = a.bincount().cpu().numpy().cumsum(0)
-print(c)
+# a = torch.tensor([1, 2, 0, 1, 2, 3, 0, 1, 2], dtype=torch.int32)
+# b = a.bincount()
+# print(b)
+# c = a.bincount().cpu().numpy().cumsum(0)
+# print(c)
+
+
+torch.manual_seed(42)
+indices = torch.randperm(10).tolist()
+indices1 = torch.randperm(10).tolist()
+print(indices)
+print(indices1)
