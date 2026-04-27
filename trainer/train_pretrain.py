@@ -1,6 +1,8 @@
 import os
 import sys
 
+# os.environ["PYTORCH_CUDA_ALLOC_CONF"] = ("expandable_segments:True,garbage_collection_threshold:0.8")
+
 
 __package__ = "trainer"
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -179,7 +181,7 @@ if __name__ == "__main__":
     parser.add_argument("--save_interval", type=int, default=1000, help="模型保存间隔")
 
     # ========== 模型架构参数 ==========
-    parser.add_argument("--hidden_size", default=512, type=int, help="隐藏层维度")
+    parser.add_argument("--hidden_size", default=768, type=int, help="隐藏层维度")
     parser.add_argument("--num_hidden_layers", default=8, type=int, help="隐藏层数量")
     parser.add_argument(
         "--max_seq_len", default=512, type=int, help="训练的最大截断长度"
@@ -334,13 +336,43 @@ if __name__ == "__main__":
     if ckp_data:
         # 恢复模型参数
         model.load_state_dict(ckp_data["model"])
+        del ckp_data["model"]
+
+        # 🚀【绝对黑科技：强行模拟从零训练的内存分配顺序，击碎碎片化】🚀
+        Logger("正在执行 Dummy Pass 预分配显存，防止碎片化 OOM...")
+        model.train()
+        # 制造一个假数据 (尺寸必须和你的真实训练数据一模一样)
+        dummy_ids = torch.ones(
+            (args.batch_size, args.max_seq_len), dtype=torch.long, device=args.device
+        )
+        with autocast_ctx:
+            res = model(input_ids=dummy_ids, attention_mask=dummy_ids, labels=dummy_ids)
+            loss = res.loss + res.aux_loss
+        # 只为了分配梯度显存，不需要 scaler，也不更新参数
+        loss.backward()
+        # 清空数值，但底层的巨型连续显存块已被永久“撑开”预留！
+        optimizer.zero_grad(set_to_none=True)
+        # 💥 【极其关键的补救】：销毁 dummy pass 产生的全部巨型张量！
+        del dummy_ids, res, loss
+        import gc
+
+        gc.collect()
+        torch.cuda.empty_cache()  # 此时大块激活值显存已预留，且无任何冗余占用！
+
         # 恢复优化器状态（动量、方差估计等）
         optimizer.load_state_dict(ckp_data["optimizer"])
+        del ckp_data["optimizer"]
         # 恢复梯度缩放器状态
         scaler.load_state_dict(ckp_data["scaler"])
         # 恢复训练进度
         start_epoch = ckp_data["epoch"]
         start_step = ckp_data.get("step", 0)
+
+        del ckp_data
+        import gc
+
+        gc.collect()  # 强制回收 Python 内存垃圾
+        torch.cuda.empty_cache()  # 强制清空 GPU 显存碎片
 
     # ========== 7. 编译和分布式包装 ==========
     if args.use_compile == 1:
@@ -366,7 +398,7 @@ if __name__ == "__main__":
         g.manual_seed(42 + epoch)
         # 只让 randperm 使用这个专属的 Generator，绝不污染全局环境！
         indices = torch.randperm(len(train_ds), generator=g).tolist()
-        
+
         skip = start_step if (epoch == start_epoch and start_step > 0) else 0
         batch_sampler = SkipBatchSampler(
             train_sampler or indices, args.batch_size, skip

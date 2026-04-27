@@ -199,11 +199,11 @@ if __name__ == "__main__":
     parser.add_argument("--save_interval", type=int, default=1000, help="模型保存间隔")
 
     # ========== 模型架构参数 ==========
-    parser.add_argument("--hidden_size", default=512, type=int, help="隐藏层维度")
+    parser.add_argument("--hidden_size", default=768, type=int, help="隐藏层维度")
     parser.add_argument("--num_hidden_layers", default=8, type=int, help="隐藏层数量")
     parser.add_argument(
         "--max_seq_len",
-        default=512,
+        default=768,
         type=int,
         help="训练的最大截断长度（中文1token≈1.5~1.7字符）",
     )

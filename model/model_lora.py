@@ -66,6 +66,7 @@ def save_lora(model, path):
             }
             state_dict.update(lora_state)
     torch.save(state_dict, path)
+    del state_dict
 
 
 def merge_lora(model, lora_path, save_path):

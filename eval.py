@@ -70,7 +70,7 @@ def main():
     )
     parser.add_argument(
         "--hidden_size",
-        default=512,
+        default=768,
         type=int,
         help="隐藏层维度（512=Small-26M, 640=MoE-145M, 768=Base-104M）",
     )
