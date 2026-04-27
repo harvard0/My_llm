@@ -7,7 +7,7 @@ import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM, TextStreamer
 from model.MizukiModel import MizukiMindConfig, MizukiMindForCausalLM
 
-# from model.model_lora import apply_lora, load_lora  # ！修正：原缺少LoRA加载支持
+from model.model_lora import apply_lora, load_lora
 from trainer.trainer_utils import setup_seed
 
 warnings.filterwarnings("ignore")
@@ -30,7 +30,6 @@ def init_model(args):
             torch.load(ckp, map_location=args.device), strict=True
         )  # strict=False会静默忽略丢失/多余的权重键
 
-        # ！修正：原缺少LoRA加载逻辑
         if args.lora_weight != "None":
             apply_lora(model)
             load_lora(
@@ -184,7 +183,7 @@ def main():
             temperature=args.temperature,
             repetition_penalty=args.repetition_penalty,
         )
-        
+
         response = tokenizer.decode(
             generated_ids[len(inputs["input_ids"][0]) :], skip_special_tokens=True
         )

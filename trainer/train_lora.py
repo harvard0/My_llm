@@ -470,17 +470,11 @@ if __name__ == "__main__":
         start_epoch = ckp_data["epoch"]
         start_step = ckp_data.get("step", 0)
 
-    # ========== 8. 编译和分布式包装 ==========
+    # ========== 8. 分布式包装 ==========
     # 📚 分布式数据并行
     # DistributedDataParallel: PyTorch的DDP实现
     # 将模型包装为分布式版本，支持多GPU训练
     # _ddp_params_and_buffers_to_ignore: 忽略不需要同步的缓冲区（如位置编码）
-    if args.use_compile == 1:
-        args.use_compile = 0
-        Logger(
-            "[LoRA] monkey-patch forward 与 torch.compile 不兼容，use_compile 已自动关闭"
-        )
-
     if dist.is_initialized():
         model._ddp_params_and_buffers_to_ignore = {"freqs_cos", "freqs_sin"}
         model = DistributedDataParallel(model, device_ids=[local_rank])
@@ -519,9 +513,9 @@ if __name__ == "__main__":
             Logger(
                 f"Epoch [{epoch + 1}/{args.epochs}]: 跳过前{start_step}个step，从step {start_step + 1}开始"
             )
-            train_epoch(epoch, loader, len(loader) + skip, start_step, wandb)
+            train_epoch(epoch, loader, len(loader) + skip, lora_params, start_step, wandb)
         else:
-            train_epoch(epoch, loader, len(loader), 0, wandb)
+            train_epoch(epoch, loader, len(loader), lora_params, 0, wandb)
 
     # ========== 10. 清理分布进程 ==========
     if dist.is_initialized():

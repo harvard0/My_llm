@@ -10,7 +10,7 @@ import warnings  # 警告控制
 import torch  # PyTorch框架
 import torch.distributed as dist  # 分布式训练支持
 from contextlib import nullcontext  # 上下文管理器
-from torch import optim, nn  # 优化器和神经网络模块
+from torch import optim  # 优化器
 from torch.nn.parallel import DistributedDataParallel  # 分布式数据并行
 from torch.utils.data import DataLoader, DistributedSampler  # 数据加载器
 
@@ -158,7 +158,7 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
             del state_dict  # 释放内存
 
         # 释放显存，加快垃圾回收
-        del input_ids, labels, res, loss
+        del input_ids, labels, attention_mask, res, loss
 
     if last_step > start_step and last_step % args.accumulation_steps != 0:
         scaler.unscale_(optimizer)
@@ -241,6 +241,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--wandb_project", type=str, default="MizukiMind-Full-SFT", help="wandb项目名"
     )
+    
+    # ========== 其他参数 ==========
     parser.add_argument(
         "--use_compile",
         default=0,
@@ -385,7 +387,8 @@ if __name__ == "__main__":
             batch_sampler=batch_sampler,
             num_workers=args.num_workers,
             worker_init_fn=seed_worker,
-            pin_memory=True,
+            pin_memory=True,    # 加速CPU->GPU数据传输
+            drop_last=False,
         )
 
         if skip > 0:

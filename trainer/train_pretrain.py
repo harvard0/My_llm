@@ -85,7 +85,7 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
             eta_min = spend_time / max(step - start_step, 1) * (iters - step) // 60
 
             Logger(
-                f"Epoch:[{epoch + 1}/{args.epochs}]({step}/{iters}) loss:{current_loss:.6f} aux_loss: {current_aux_loss:.6f} lr:{current_lr:.12f} epoch_Time:{eta_min}min:"
+                f"Epoch:[{epoch + 1}/{args.epochs}]({step}/{iters}) loss:{current_loss:.6f} logits_loss:{current_logits_loss:.6f} aux_loss: {current_aux_loss:.6f} lr:{current_lr:.12f} epoch_Time:{eta_min}min:"
             )
 
             # 记录到实验跟踪系统
@@ -119,8 +119,7 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
 
             # 📚 半精度保存知识点
             # 将float32参数转为float16，减少存储空间
-            state_dict = {k: v.half().cpu() for k, v in state_dict.items()}
-            torch.save(state_dict, ckp)
+            torch.save({k: v.half().cpu() for k, v in state_dict.items()}, ckp)
 
             # 保存完整训练状态
             lm_checkpoint(
@@ -138,7 +137,7 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
             model.train()  # 恢复训练模式
             del state_dict
 
-        del input_ids, labels, res, loss
+        del input_ids, labels, attention_mask, res, loss
 
     if last_step > start_step and last_step % args.accumulation_steps != 0:
         scaler.unscale_(optimizer)
@@ -220,6 +219,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--wandb_project", type=str, default="MizukiMind-Pretrain", help="wandb项目名"
     )
+
+    # ========== 其他参数 ==========
     parser.add_argument(
         "--use_compile",
         default=0,
@@ -408,7 +409,8 @@ if __name__ == "__main__":
             batch_sampler=batch_sampler,
             num_workers=args.num_workers,
             worker_init_fn=seed_worker,
-            pin_memory=True,
+            pin_memory=True,  # 加速CPU->GPU数据传输
+            drop_last=False,
         )
         if skip > 0:
             Logger(
