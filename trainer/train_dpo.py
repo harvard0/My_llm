@@ -348,7 +348,9 @@ if __name__ == "__main__":
     device_type = "cuda" if "cuda" in args.device else "cpu"
     dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float16
     autocast_ctx = (
-        nullcontext() if device_type == "cpu" else torch.amp.autocast(dtype=dtype)
+        nullcontext()
+        if device_type == "cpu"
+        else torch.amp.autocast(device_type=device_type, dtype=dtype)
     )
 
     # ========== 4. 配置wandb ==========
@@ -435,9 +437,20 @@ if __name__ == "__main__":
             Logger(
                 f"Epoch [{epoch + 1}/{args.epochs}]: 跳过前{start_step}个step，从step {start_step + 1}开始"
             )
-            train_epoch(epoch, loader, len(loader) + skip, start_step, wandb)
+            train_epoch(
+                epoch,
+                loader,
+                len(loader) + skip,
+                ref_model,
+                lm_config,
+                start_step,
+                wandb,
+                args.beta,
+            )
         else:
-            train_epoch(epoch, loader, len(loader), 0, wandb)
+            train_epoch(
+                epoch, loader, len(loader), ref_model, lm_config, 0, wandb, args.beta
+            )
 
     # ========== 9. 清理分布式进程 ==========
     if dist.is_initialized():
